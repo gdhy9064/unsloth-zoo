@@ -574,6 +574,40 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
+    # Optional fast-path: route the standard chunked loss through the fused
+    # cut_cross_entropy kernel (fused_linear_cross_entropy) instead, so that
+    # normal SFTTrainer training invokes it end-to-end. Opt-in via
+    # UNSLOTH_ENABLE_CCE=1 (the same gate unsloth uses elsewhere); guarded on
+    # the CCE API's preconditions. Lazy import to avoid a circular import:
+    # loss_utils re-exports this function (loss_utils.py:84).
+    _cce_ready = (
+        os.environ.get("UNSLOTH_ENABLE_CCE", "0") == "1"
+        and mask is None                      # CCE has no packed-boundary masking
+        and shift_labels is True              # CCE always shifts internally
+        and not overwrite                     # CCE cannot overwrite inputs with grads
+        and not lm_head_weight.requires_grad  # CCE requires a frozen lm_head
+        and lm_head_weight.dtype != torch.float32
+        and float(kwargs.get("label_smoothing", 0.0)) == 0.0
+    )
+    if _cce_ready:
+        try:
+            from unsloth_zoo.loss_utils import fused_linear_cross_entropy as _cce
+        except Exception:
+            _cce = None
+        if _cce is not None:
+            _n_items = n_items if n_items is not None else kwargs.get("num_items_in_batch")
+            loss = _cce(
+                hidden_states,
+                lm_head_weight,
+                labels,
+                num_items_in_batch = _n_items,
+                ignore_index = int(kwargs.get("ignore_index", -100)),
+                logit_softcapping = float(kwargs.get("logit_softcapping", 0) or 0),
+            )
+            if scaling is not None:
+                loss = loss * scaling
+            return loss
+
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
